@@ -216,21 +216,30 @@ if __name__ == '__main__':
 
     import matplotlib.pyplot as plt
 
-    iris = load_iris()
-    X = iris.data
+    n_samples, random_state = 1500, 1
+    X1, y1 = make_blobs(n_samples=n_samples, random_state=random_state,
+                        centers=3)
+    X2, y2 = make_blobs(n_samples=n_samples, random_state=random_state,
+                        centers=2)
+    X = np.vstack((X1, X2 + 10))
+
+    # iris = load_iris()
+    # X = iris.data
 
     estimator = KMeans()
 
     n_clusters_range = np.arange(1, 8)
-    search = OptimalNClusterSearch(estimator=estimator,
-                                   n_clusters_range=n_clusters_range,
-                                   fitting_process='gap').fit(X)
+%timeit search = OptimalNClusterSearch(estimator=estimator, n_clusters_range=n_clusters_range, fitting_process='gap', random_state=0).fit(X)
 
-    print("Optimal number of clusters : %s" % search.best_estimator_)
+    # search = OptimalNClusterSearch(estimator=estimator,
+    #                                n_clusters_range=n_clusters_range,
+    #                                fitting_process='gap').fit(X)
 
-    plt.figure()
-    plt.scatter(X[:, 0], X[:, 1])
+    # print("Optimal number of clusters : %s" % search.best_estimator_)
 
-    plt.figure()
-    plt.plot(n_clusters_range, search.score_, 'o-', alpha=.6)
-    plt.show()
+    # plt.figure()
+    # plt.scatter(X[:, 0], X[:, 1])
+
+    # plt.figure()
+    # plt.plot(n_clusters_range, search.score_, 'o-', alpha=.6)
+    # plt.show()

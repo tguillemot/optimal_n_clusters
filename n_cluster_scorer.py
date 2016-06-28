@@ -1,7 +1,7 @@
 # TODO:
 # X. Refactor method into specific classes 22/06
 # 2. Add verbose method ? 23/06
-# . Check if we cannot do something better 23/06
+# X Check if we cannot do something better 23/06
 # 3.1. Add warning when n_clusters is 1 for metrics methods
 # 3.2. Add a random computation ???
 # 4. Add the support of pandas + ... 23/06
@@ -9,11 +9,11 @@
 # X. Add parameters
 # X.X Add parameters.range
 # X.X Add parameters.specific values
-# 5.3 Ajouter plusieurs parametres differents
+# X.X Ajouter plusieurs parametres differents
 # 5. Tests 24/06
 # 6. Docs 24/06
 # 7. Gestion des mauvaise valeurs
-# 8. Add parallel
+# X. Add parallel
 
 import warnings
 import numpy as np
@@ -23,19 +23,42 @@ from sklearn.externals import six
 from sklearn.utils import check_array, check_random_state
 from sklearn.utils.testing import ignore_warnings
 from sklearn.model_selection import ParameterGrid
+from sklearn.externals.joblib import Parallel, delayed
+
+from sklearn.base import clone
 
 
 class _NClusterSearchBase(six.with_metaclass(ABCMeta, object)):
-    def __init__(self, estimator, parameters):
+    def __init__(self, estimator, parameters, n_jobs=4,
+                 pre_dispatch='2*n_jobs', verbose=0):
         self.estimator = estimator
         self.parameters = parameters.copy()
+        self.n_jobs = n_jobs
+        self.pre_dispatch = pre_dispatch
+        self.verbose = verbose
 
     @abstractmethod
-    def _fit_and_score(self, X, y=None):
+    def _parameter_grid(self, X, y):
+        pass
+
+    @abstractmethod
+    def _estimator_fit(self, estimator, X, y, parameters):
+        pass
+
+    @abstractmethod
+    def _score(self, X, out):
         pass
 
     def fit(self, X, y):
-        self.score_ = self._fit_and_score(X, y)
+        base_estimator = clone(self.estimator)
+
+        out = Parallel(
+            n_jobs=self.n_jobs, verbose=self.verbose,
+            pre_dispatch=self.pre_dispatch
+        )(delayed(self._estimator_fit)(clone(base_estimator), X, y, parameters)
+          for parameters in self._parameter_grid(X, y))
+
+        self.score_, _ = self._score(X, out)
 
         # Ajouter support best_estimator une fois pandas géré
         # optimal_n_clusters = self.n_clusters_range[np.nanargmax(self.score_)]
@@ -48,29 +71,31 @@ class _NClusterSearchBase(six.with_metaclass(ABCMeta, object)):
 
 # Search for unsupervised metrics
 class UnsupervisedMetricSearch(_NClusterSearchBase):
-    def __init__(self, estimator, parameters, n_clusters_range, metric):
+    def __init__(self, estimator, parameters, metric):
         super(UnsupervisedMetricSearch, self).__init__(
-            estimator, n_clusters_range)
-        self.parameters = parameters
+            estimator, parameters)
         self.metric = metric
 
-    def _fit_and_score(self, X, y=None):
+    def _parameter_grid(self, X, y):
         parameters_iterable = ParameterGrid(self.parameters)
+        for params in parameters_iterable:
+            yield params
 
-        score = np.empty(len(parameters_iterable))
-        # parameters = np.empty(score.shape, dtype=dict)
-        for k, params in enumerate(parameters_iterable):
-            try:
-                self.estimator.set_params(**params)
-                score[k] = self.metric(X, self.estimator.fit_predict(X))
-            except ValueError:
-                # TODO Add a warning for false values
-                warnings.warn('Put a warning.')
-                score[k] = np.nan
-            # parameters[k] = params
+    def _estimator_fit(self, estimator, X, y, parameters):
+        estimator.set_params(**parameters)
+        try:
+            score = self.metric(X, estimator.fit_predict(X))
+        except ValueError:
+            # TODO Add a warning for false values
+            warnings.warn('Put a warning.')
+            score = np.nan
 
-        return score
-        # return score, parameters
+        return score, parameters
+
+    def _score(self, X, out):
+        scores, parameters = zip(*out)
+
+        return np.array(scores), parameters
 
 
 # Scorer for supervised metrics
@@ -84,32 +109,33 @@ class StabilitySearch(_NClusterSearchBase):
         self.p_samples = p_samples
         self.random_state = random_state
 
-    def _fit_and_score(self, X, y=None):
+    def _parameter_grid(self, X, y):
         n_samples, _ = X.shape
         rng = check_random_state(self.random_state)
-        parameters_iterable = ParameterGrid(self.parameters)
-
-        # Compute the random data once for all
         self.data_ = (
             rng.uniform(size=(self.n_draws, 2 * n_samples)) < self.p_samples)
 
-        score = np.empty(len(parameters_iterable))
-        # parameters = np.empty(score.shape, dtype=dict)
-        for k, params in enumerate(parameters_iterable):
-            self.estimator.set_params(**params)
-            draw_scores = np.empty(self.n_draws)
-            for l, d in enumerate(self.data_):
-                p1, p2 = np.split(d, 2)
+        parameters_iterable = ParameterGrid(self.parameters)
+        for params in parameters_iterable:
+            yield params
 
-                labels1 = self.estimator.fit_predict(X[p1])
-                labels2 = self.estimator.fit_predict(X[p2])
+    def _estimator_fit(self, estimator, X, y, parameters):
+        estimator.set_params(**parameters)
+        draw_scores = np.empty(self.n_draws)
+        for l, d in enumerate(self.data_):
+            p1, p2 = np.split(d, 2)
 
-                draw_scores[l] = self.metric(labels1[p2[p1]], labels2[p1[p2]])
-            score[k] = draw_scores.mean()
-            # parameters[k] = params
+            labels1 = estimator.fit_predict(X[p1])
+            labels2 = estimator.fit_predict(X[p2])
 
-        return score
-        # return score, parameters
+            draw_scores[l] = self.metric(labels1[p2[p1]], labels2[p1[p2]])
+        score = draw_scores.mean()
+        return score, parameters
+
+    def _score(self, X, out):
+        scores, parameters = zip(*out)
+
+        return np.array(scores), parameters
 
 
 # Scorer for distortion jump
@@ -118,9 +144,7 @@ class DistortionJumpSearch(_NClusterSearchBase):
         super(DistortionJumpSearch, self).__init__(
             estimator, parameters)
 
-    def _fit_and_score(self, X, y=None):
-        _, n_features = X.shape
-
+    def _parameter_grid(self, X, y):
         # Extraction of n_clusters or n_components from parameters
         n_clusters_list = self.parameters.pop('n_clusters', None)
         if n_clusters_list is None:
@@ -129,27 +153,30 @@ class DistortionJumpSearch(_NClusterSearchBase):
             raise ValueError("Pas n_clusters ou n_components")
 
         # Compute n_clusters parameters
-        n_clusters_values, index = np.unique(
+        self.n_clusters_values, self._index = np.unique(
             np.hstack((n_clusters_list, np.array(n_clusters_list) + 1)),
             return_index=True)
-        index = index < len(n_clusters_list)
+        self._index = self._index < len(n_clusters_list)
 
         parameters_iterable = ParameterGrid(self.parameters)
-        distortion = np.empty((len(n_clusters_values),
-                               len(parameters_iterable)))
-        # parameters = np.empty(distortion.shape, dtype=dict)
-        for k, n_clusters in enumerate(n_clusters_values):
-            for l, params in enumerate(parameters_iterable):
-                params['n_clusters'] = n_clusters
-                self.estimator.set_params(**params)
-                distortion[k, l] = (
-                    (self.estimator.fit(X).score(X) / n_features) **
-                    (-n_features / 2))
-                # parameters[k, l] = params
 
-        # return (distortion[index] - distortion[1:][index[:-1]],
-        #        parameters[index])
-        return distortion[index] - distortion[1:][index[:-1]]
+        for n_clusters in self.n_clusters_values:
+            for params in parameters_iterable:
+                params['n_clusters'] = n_clusters
+                yield params
+
+    def _estimator_fit(self, estimator, X, y, parameters):
+        _, n_features = X.shape
+        estimator.set_params(**parameters)
+        distortion = (np.array(estimator.fit(X).score(X)) /
+                      n_features) ** (-n_features / 2)
+        return distortion, parameters
+
+    def _score(self, X, out):
+        distortion, _ = zip(*out)
+        distortion = np.array(distortion).reshape(
+            len(self.n_clusters_values), -1)
+        return distortion[self._index] - distortion[1:][self._index[:-1]]
 
 
 # Scorer for Pham
@@ -158,9 +185,7 @@ class PhamSearch(_NClusterSearchBase):
         super(PhamSearch, self).__init__(
             estimator, parameters)
 
-    def _fit_and_score(self, X, y=None):
-        _, n_features = X.shape
-
+    def _parameter_grid(self, X, y):
         # Extraction of n_clusters or n_components from parameters
         n_clusters_list = self.parameters.pop('n_clusters', None)
         if n_clusters_list is None:
@@ -169,33 +194,44 @@ class PhamSearch(_NClusterSearchBase):
             raise ValueError("Pas n_clusters ou n_components")
 
         # Compute n_clusters parameters
-        n_clusters_values, index = np.unique(
+        self.n_clusters_values, self._index = np.unique(
             np.hstack((n_clusters_list, np.array(n_clusters_list) - 1)),
             return_index=True)
-        index = index < len(n_clusters_list)
+        self._index = self._index < len(n_clusters_list)
 
         parameters_iterable = ParameterGrid(self.parameters)
-        inertia = np.empty((len(n_clusters_values), len(parameters_iterable)))
-        for k, n_clusters in enumerate(n_clusters_values):
-            for l, params in enumerate(parameters_iterable):
-                if n_clusters == 0:
-                    continue
-                params['n_clusters'] = n_clusters
-                self.estimator.set_params(**params)
-                inertia[k, l] = self.estimator.fit(X).score(X)
 
-        weights = 1. - np.exp((n_clusters_values[index] - 2) *
+        for n_clusters in self.n_clusters_values:
+            for params in parameters_iterable:
+                params['n_clusters'] = n_clusters
+                yield params
+
+    def _estimator_fit(self, estimator, X, y, parameters):
+        estimator.set_params(**parameters)
+        if parameters['n_clusters'] == 0:
+            return np.nan, parameters
+        return estimator.fit(X).score(X), parameters
+
+    def _score(self, X, out):
+        _, n_features = X.shape
+
+        scores, parameters = zip(*out)
+
+        scores = np.array(scores).reshape(len(self.n_clusters_values), -1)
+
+        weights = 1. - np.exp((self.n_clusters_values[self._index] - 2) *
                               np.log(5. / 6.) + np.log(.75) -
                               np.log(n_features))
 
         with ignore_warnings(category=RuntimeWarning):
-            score = np.where(inertia[index] != 0., inertia[index] / (
-                weights[:, np.newaxis] * inertia[:-1][index[1:]]), 1.)
+            scores = np.where(scores[self._index] != 0., (
+                scores[self._index] / (weights[:, np.newaxis] *
+                                       scores[:-1][self._index[1:]]), 1.))
 
-        if n_clusters_values[0] == 0:
-            score[0, :] = 1.
+        if self.n_clusters_values[0] == 0:
+            scores[0, :] = 1.
 
-        return -score
+        return -scores, parameters
 
 
 # Scorer for Gap
@@ -205,14 +241,14 @@ class GapSearch(_NClusterSearchBase):
         self.n_draws = n_draws
         self.random_state = random_state
 
-    def _fit_and_score(self, X, y=None):
+    def _parameter_grid(self, X, y):
         n_samples, n_features = X.shape
         rng = check_random_state(self.random_state)
 
         # Compute the random data once for all
         bb_min, bb_max = np.min(X, 0), np.max(X, 0)
-        data = (rng.uniform(size=(self.n_draws, n_samples, n_features)) *
-                (bb_max - bb_min) + bb_min)
+        self._data = (rng.uniform(size=(self.n_draws, n_samples, n_features)) *
+                      (bb_max - bb_min) + bb_min)
 
         # Extraction of n_clusters or n_components from parameters
         n_clusters_list = self.parameters.pop('n_clusters', None)
@@ -222,35 +258,46 @@ class GapSearch(_NClusterSearchBase):
             raise ValueError("Pas n_clusters ou n_components")
 
         # Compute n_clusters parameters
-        n_clusters_values, index = np.unique(
+        self.n_clusters_values, self._index = np.unique(
             np.hstack((n_clusters_list, np.array(n_clusters_list) + 1)),
             return_index=True)
-        index = index < len(n_clusters_list)
+        self._index = self._index < len(n_clusters_list)
 
         parameters_iterable = ParameterGrid(self.parameters)
-        expected_inertia = np.empty((len(n_clusters_values),
-                                     len(parameters_iterable)))
-        estimated_inertia = np.empty(expected_inertia.shape)
-        safety = np.empty(expected_inertia.shape)
-        inertia_n_draws = np.empty(self.n_draws)
 
-        for k, n_clusters in enumerate(n_clusters_values):
-            for l, params in enumerate(parameters_iterable):
+        for n_clusters in self.n_clusters_values:
+            for params in parameters_iterable:
                 params['n_clusters'] = n_clusters
-                self.estimator.set_params(**params)
+                yield params
 
-                estimated_inertia[k, l] = -estimator.fit(X).score(X)
-                for t, Xt in enumerate(data):
-                    inertia_n_draws[t] = -estimator.fit(Xt).score(Xt)
-                inertia_n_draws = np.log(inertia_n_draws)
-                expected_inertia[k, l] = np.mean(inertia_n_draws)
-                safety[k, l] = (np.std(inertia_n_draws) *
-                                np.sqrt(1. + 1. / self.n_draws))
+    def _estimator_fit(self, estimator, X, y, parameters):
+        estimator.set_params(**parameters)
 
-        # Compute the gap score
+        estimated_inertia = -estimator.fit(X).score(X)
+        inertia_n_draws = np.empty(self.n_draws)
+        for t, Xt in enumerate(self._data):
+            inertia_n_draws[t] = -estimator.fit(Xt).score(Xt)
+
+        inertia_n_draws = np.log(inertia_n_draws)
+        expected_inertia = np.mean(inertia_n_draws)
+        safety = (np.std(inertia_n_draws) *
+                  np.sqrt(1. + 1. / self.n_draws))
+
+        return expected_inertia, estimated_inertia, safety, parameters
+
+    def _score(self, X, out):
+        expected_inertia, estimated_inertia, safety, parameters = zip(*out)
+
+        expected_inertia = np.array(expected_inertia).reshape(
+            len(self.n_clusters_values), -1)
+        estimated_inertia = np.array(estimated_inertia).reshape(
+            len(self.n_clusters_values), -1)
+        safety = np.array(safety).reshape(len(self.n_clusters_values), -1)
+
         gap = expected_inertia - np.log(estimated_inertia)
 
-        return gap[index] - gap[1:][index[:-1]] + safety[1:][index[:-1]]
+        return (gap[self._index] - gap[1:][self._index[:-1]] +
+                safety[1:][self._index[:-1]]), parameters
 
 
 # Ajouter les arguments qui remplacent
@@ -316,21 +363,20 @@ if __name__ == '__main__':
     # iris = load_iris()
     # X = iris.data
 
-    estimator = KMeans()
+    estimator = KMeans(random_state=0)
 
     n_clusters_range = np.arange(1, 8)
-    parameters = {'n_clusters': (1, 2, 3, 4, 6, 7), 'random_state': np.arange(3)}
-    search = OptimalNClusterSearch(estimator=estimator,
-                                   parameters=parameters,
-                                   fitting_process='distortion_jump').fit(X)
+    parameters = {'n_clusters': (1, 2, 3, 4, 5, 6, 7), 'random_state': (0, 3)}
+    search = OptimalNClusterSearch(estimator=estimator, parameters=parameters,
+                                   fitting_process='gap').fit(X)
 
-    print("Optimal number of clusters : %s" % search.best_estimator_)
+    # print("Optimal number of clusters : %s" % search.best_estimator_)
 
-    plt.figure()
-    plt.scatter(X[:, 0], X[:, 1])
+    # plt.figure()
+    # plt.scatter(X[:, 0], X[:, 1])
 
     print(search.score_)
 
-    plt.figure()
-    plt.plot(parameters['n_clusters'], search.score_, 'o-', alpha=.6)
-    plt.show()
+    # plt.figure()
+    # plt.plot(parameters['n_clusters'], search.score_, 'o-', alpha=.6)
+    # plt.show()
